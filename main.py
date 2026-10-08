@@ -1,8 +1,9 @@
 """Delete all of your own messages in a Slack channel using browser session tokens.
 
 Two subcommands:
-  scan    - fetch all your message IDs in a channel, save to a JSONL file
-  delete  - read the JSONL file and delete each message, marking progress
+  scan    - find all your message IDs in a channel (via Slack search, or the
+            whole channel history with --full), save to a JSONL file
+  delete  - read the channel's JSONL file and delete each message, marking progress
 
 Uses the unofficial xoxc token + `d` cookie from a logged-in Slack web session.
 This is against Slack's Terms of Service; use at your own risk.
@@ -13,7 +14,7 @@ Env:
 
 Example:
     uv run main.py scan   --workspace my-workspace --channel my-channel
-    uv run main.py delete --workspace my-workspace --file my-channel.jsonl
+    uv run main.py delete --workspace my-workspace --channel my-channel
 
 How to obtain the tokens (Chrome/Firefox):
   1. Open https://<workspace>.slack.com and log in.
@@ -30,9 +31,10 @@ import os
 import random
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -50,6 +52,8 @@ _METHOD_MIN_INTERVAL = {
     "conversations.replies": 1.5,
     "conversations.history": 1.5,
     "conversations.list": 1.5,
+    # Tier 2 (~20/min).
+    "search.messages": 3.0,
     "chat.delete": 1.3,
 }
 _DEFAULT_MIN_INTERVAL = 0.2
@@ -184,6 +188,47 @@ class SlackClient:
             if not cursor:
                 return
 
+    def iter_search(self, query: str) -> Iterator[dict[str, Any]]:
+        """Yield `search.messages` matches, newest first."""
+        cursor = "*"
+        page = 1
+        while True:
+            params: dict[str, Any] = {
+                "query": query,
+                "count": 100,
+                "sort": "timestamp",
+                "sort_dir": "desc",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            else:
+                params["page"] = page
+            messages = self._post("search.messages", params).get("messages", {})
+            matches = messages.get("matches", [])
+            yield from matches
+            if not matches:
+                return
+            paging = messages.get("paging", {})
+            cursor = (
+                messages.get("pagination", {}).get("next_cursor")
+                or paging.get("next_cursor")
+                or ""
+            )
+            if cursor:
+                continue
+            # No cursor in the response: fall back to page numbers, which Slack
+            # caps at 100 pages.
+            if page >= paging.get("pages", 1):
+                return
+            page += 1
+            if page > 100:
+                print(
+                    "  WARNING: search results capped at 100 pages; re-run with "
+                    "an older --since window or with --full to get the rest",
+                    file=sys.stderr,
+                )
+                return
+
     def delete_message(self, channel_id: str, ts: str) -> None:
         self._post("chat.delete", {"channel": channel_id, "ts": ts})
 
@@ -229,6 +274,50 @@ def _msg_has_video(msg: dict[str, Any]) -> bool:
         if (fobj.get("filetype") or "").lower() in {"mp4", "mov", "webm", "mkv", "avi", "m4v"}:
             return True
     return False
+
+
+def _search_thread_ts(match: dict[str, Any]) -> str | None:
+    """Search matches don't carry `thread_ts`; it's only in the permalink."""
+    qs = parse_qs(urlparse(match.get("permalink") or "").query)
+    return (qs.get("thread_ts") or [None])[0]
+
+
+def _scan_search(
+    slack: SlackClient, channel_id: str, user_id: str, since_ts: str | None,
+    emit: Any,
+) -> int:
+    query = f"from:<@{user_id}> in:<#{channel_id}>"
+    if since_ts:
+        # `after:` is day-granular, exclusive and evaluated in Slack's idea of
+        # your timezone, so search a little wider and filter exactly below.
+        day = datetime.fromtimestamp(float(since_ts)) - timedelta(days=2)
+        query += f" after:{day:%Y-%m-%d}"
+    print(f"Searching: {query}", flush=True)
+
+    scanned = 0
+    for match in slack.iter_search(query):
+        scanned += 1
+        ts = match.get("ts")
+        if (
+            ts
+            and match.get("user") == user_id
+            and (match.get("channel") or {}).get("id") == channel_id
+            and (since_ts is None or float(ts) >= float(since_ts))
+        ):
+            rec = {"channel": channel_id, "ts": ts}
+            thread_ts = _search_thread_ts(match)
+            if thread_ts and thread_ts != ts:
+                rec["thread_ts"] = thread_ts
+            emit({
+                **rec,
+                "text_preview": (match.get("text", "") or "")[:120],
+                "has_image": _msg_has_image(match),
+                "has_video": _msg_has_video(match),
+                "deleted": False,
+            })
+        if scanned % 100 == 0:
+            print(f"  scanned={scanned}", flush=True)
+    return scanned
 
 
 def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
@@ -278,7 +367,14 @@ def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
                             oldest_main = ts
             resume_latest = oldest_main
             mode = "a"
-            if resume_latest:
+            if not args.full:
+                # Search only returns your own messages, so a full re-run is cheap.
+                resume_latest = None
+                print(
+                    f"{out_path} exists with {len(existing_ts)} records; "
+                    f"appending new ones (dedup by ts)."
+                )
+            elif resume_latest:
                 print(
                     f"Resuming: {len(existing_ts)} records in {out_path}, "
                     f"continuing older than ts={resume_latest}"
@@ -301,6 +397,11 @@ def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
             f.write(json.dumps(rec) + "\n")
             f.flush()
             count += 1
+
+        if not args.full:
+            scanned = _scan_search(slack, channel_id, user_id, since_ts, emit)
+            print(f"Saved {count} new message IDs to {out_path} (scanned {scanned} this run)")
+            return 0
 
         print("Scanning main timeline...", flush=True)
         for msg in slack.iter_messages(channel_id, latest=resume_latest, oldest=since_ts):
@@ -368,9 +469,9 @@ def _parse_delay(spec: str) -> tuple[float, float]:
 
 
 def cmd_delete(args: argparse.Namespace, slack: SlackClient) -> int:
-    path = Path(args.file)
+    path = Path(args.file or f"{args.channel.lstrip('#')}.jsonl")
     if not path.exists():
-        print(f"ERROR: {path} not found", file=sys.stderr)
+        print(f"ERROR: {path} not found; run scan first", file=sys.stderr)
         return 2
 
     records = _load_records(path)
@@ -475,6 +576,13 @@ def main() -> int:
     ps.add_argument("-o", "--output", help="Output JSONL path (default <channel>.jsonl)")
     ps.add_argument("--overwrite", action="store_true")
     ps.add_argument(
+        "--full", action="store_true",
+        help="Read the whole channel history (and every thread) instead of "
+             "finding your messages via Slack search (from:me in:channel). "
+             "Much slower on big channels, but doesn't rely on Slack's search "
+             "index.",
+    )
+    ps.add_argument(
         "--since", default=os.environ.get("SLACK_SINCE"),
         help="Only scan messages at or after this time. Accepts a Slack ts "
              "(e.g. 1700000000.000000) or a local date/datetime "
@@ -482,7 +590,14 @@ def main() -> int:
     )
 
     pd = sub.add_parser("delete", help="Delete messages listed in a JSONL file")
-    pd.add_argument("--file", required=True, help="JSONL produced by scan")
+    pd.add_argument(
+        "--channel", default=os.environ.get("SLACK_CHANNEL"),
+        help="Channel name; deletes from <channel>.jsonl (env: SLACK_CHANNEL)",
+    )
+    pd.add_argument(
+        "--file",
+        help="JSONL produced by scan, if it isn't <channel>.jsonl (scan -o)",
+    )
     pd.add_argument("--dry-run", action="store_true")
     pd.add_argument("--yes", action="store_true")
     pd.add_argument(
@@ -502,6 +617,9 @@ def main() -> int:
         return 2
     if args.cmd == "scan" and not args.channel:
         print("ERROR: scan: --channel or SLACK_CHANNEL is required", file=sys.stderr)
+        return 2
+    if args.cmd == "delete" and not (args.channel or args.file):
+        print("ERROR: delete: --channel or SLACK_CHANNEL is required", file=sys.stderr)
         return 2
 
     token = os.environ.get("SLACK_TOKEN")

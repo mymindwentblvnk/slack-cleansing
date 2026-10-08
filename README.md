@@ -7,6 +7,49 @@ tokens extracted from a logged-in Slack web session.
 > against Slack's Terms of Service. Use at your own risk on workspaces where
 > you're allowed to do so.
 
+## Quick start
+
+```sh
+# 1. One-time setup
+cp .env.example .env             # fill in SLACK_WORKSPACE, SLACK_TOKEN, SLACK_COOKIE_D
+make build
+
+# 2. Collect your message IDs into my-channel.jsonl
+make scan CHANNEL=my-channel
+
+# 3. Preview what would be deleted
+make dry-run CHANNEL=my-channel
+
+# 4. Actually delete
+make delete CHANNEL=my-channel
+```
+
+All commands:
+
+| Command        | What it does                                                                 |
+|----------------|------------------------------------------------------------------------------|
+| `make build`   | Build the Docker image. Re-run after changing `main.py`.                     |
+| `make scan`    | Find your messages in a channel and save their IDs to `<channel>.jsonl`.     |
+| `make dry-run` | List what `delete` would remove from `<channel>.jsonl`, without touching Slack. |
+| `make delete`  | Delete the messages listed in `<channel>.jsonl`, after a confirmation prompt. |
+| `make shell`   | Open a shell inside the image, for debugging.                                |
+| `make clean`   | Remove the Docker image.                                                     |
+| `make help`    | Print the targets and variables.                                             |
+
+Options, passed as `make <command> NAME=value`:
+
+| Option         | Commands            | What it does                                                        |
+|----------------|---------------------|---------------------------------------------------------------------|
+| `CHANNEL=name` | scan, dry-run, delete | Channel to work on. Defaults to `SLACK_CHANNEL` from `.env`.      |
+| `SINCE=date`   | scan                | Only collect messages from this point on, e.g. `2024-01-15`.        |
+| `FULL=1`       | scan                | Read the whole channel history instead of using search. Slow but exhaustive. |
+| `SKIP_MEDIA=1` | dry-run, delete     | Leave messages with a picture or video attachment alone.            |
+| `YES=1`        | delete              | Skip the confirmation prompt.                                       |
+| `DELAY=1.1-1.4`| delete              | Seconds to wait between deletes; a number or a `MIN-MAX` range.     |
+
+See [Get your Slack credentials](#get-your-slack-credentials) for the `.env`
+values and [Usage](#usage) for details on each step.
+
 ## Requirements
 
 - **Docker**
@@ -33,7 +76,7 @@ The tool reads `.env` from the current directory. Supported keys:
 | `SLACK_WORKSPACE`| yes      | Workspace subdomain, e.g. `acme-corp`               |
 | `SLACK_TOKEN`    | yes      | Browser `xoxc-...` token                            |
 | `SLACK_COOKIE_D` | yes      | Value of the `d` cookie (`xoxd-...`)                |
-| `SLACK_CHANNEL`  | no       | Default `CHANNEL=` for `make scan`                  |
+| `SLACK_CHANNEL`  | no       | Default `CHANNEL=` for `make scan` / `make delete`  |
 | `SLACK_SINCE`    | no       | Default `SINCE=` for `make scan`                    |
 
 Make variables (`CHANNEL=`, `SINCE=`, etc.) override the matching env var. See
@@ -77,33 +120,11 @@ SLACK_COOKIE_D=xoxd-...paste...
 Tokens rotate — if you get `invalid_auth` later, redo both steps from a fresh
 Slack session.
 
-## Quick start
-
-Typical end-to-end workflow:
-
-```sh
-# 1. One-time setup
-cp .env.example .env             # fill in SLACK_WORKSPACE, SLACK_TOKEN,
-                                 # SLACK_COOKIE_D, SLACK_CHANNEL
-make build
-
-# 2. Collect your message IDs into my-channel.jsonl
-make scan CHANNEL=my-channel
-
-# 3. Preview what would be deleted (optionally skipping pictures/videos)
-make dry-run FILE=my-channel.jsonl SKIP_MEDIA=1
-
-# 4. Actually delete
-make delete FILE=my-channel.jsonl SKIP_MEDIA=1
-```
-
-If `SLACK_CHANNEL` is set in `.env`, `make scan` picks it up and you can drop
-the `CHANNEL=` arg.
-
 ## Usage
 
 The tool has two subcommands: `scan` collects your message IDs into a local
-JSONL file; `delete` reads that file and deletes them. Splitting the steps
+JSONL file; `delete` finds that file by channel name (`<channel>.jsonl`) and
+deletes them. Splitting the steps
 means a crash mid-run doesn't force a re-scan, and you can review before
 deleting.
 
@@ -135,14 +156,27 @@ make scan CHANNEL=my-channel SINCE=2024-01-15
 Dates/datetimes are interpreted in your local timezone; a raw Slack `ts` is
 accepted as-is.
 
-If the target file already exists, scan **resumes**: it reads the existing
-records, finds the oldest main-timeline `ts`, and continues fetching older
-messages from there. Records are deduped by `ts`.
+By default scan asks Slack's search for just your messages
+(`from:<you> in:<channel>`, 100 per request), so it stays fast on big channels.
+This depends on Slack's search index: very recent messages may not be indexed
+yet, and free workspaces only search the last 90 days.
+
+Add `FULL=1` to read the whole channel (and every thread) instead and keep what
+is yours. That is slow on big channels but exhaustive — both modes dedupe into
+the same file, so you can run it after a search scan to catch stragglers:
+
+```sh
+make scan CHANNEL=my-channel FULL=1
+```
+
+If the target file already exists, new records are appended and deduped by
+`ts`. With `FULL=1` scan also **resumes**: it finds the oldest main-timeline
+`ts` in the file and continues fetching older messages from there.
 
 ### 2. Dry-run (recommended)
 
 ```sh
-make dry-run FILE=my-channel.jsonl
+make dry-run CHANNEL=my-channel
 ```
 
 Lists what would be deleted without touching Slack.
@@ -150,7 +184,7 @@ Lists what would be deleted without touching Slack.
 ### 3. Delete
 
 ```sh
-make delete FILE=my-channel.jsonl
+make delete CHANNEL=my-channel
 ```
 
 Prompts for confirmation, then deletes each message and marks it
