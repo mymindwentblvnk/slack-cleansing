@@ -2,7 +2,8 @@
 
 Two subcommands:
   scan    - find all your message IDs in a channel (via Slack search, or the
-            whole channel history with --full), save to a JSONL file
+            whole channel history with --full), save to a JSONL file; with
+            --dm <user ID>, scan your direct messages with that person instead
   delete  - read the channel's JSONL file and delete each message, marking progress
 
 Uses the unofficial xoxc token + `d` cookie from a logged-in Slack web session.
@@ -15,6 +16,8 @@ Env:
 Example:
     uv run main.py scan   --workspace my-workspace --channel my-channel
     uv run main.py delete --workspace my-workspace --channel my-channel
+    uv run main.py scan   --workspace my-workspace --dm U0123ABCD
+    uv run main.py delete --workspace my-workspace --dm U0123ABCD
 
 How to obtain the tokens (Chrome/Firefox):
   1. Open https://<workspace>.slack.com and log in.
@@ -29,6 +32,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -57,6 +61,13 @@ _METHOD_MIN_INTERVAL = {
     "chat.delete": 1.3,
 }
 _DEFAULT_MIN_INTERVAL = 0.2
+
+
+def _describe_user(user: dict[str, Any]) -> str:
+    profile = user.get("profile") or {}
+    real = profile.get("real_name") or user.get("real_name") or ""
+    gone = ", deactivated" if user.get("deleted") else ""
+    return f"{user.get('name')} ({real}, {user['id']}{gone})"
 
 
 class SlackClient:
@@ -142,6 +153,23 @@ class SlackClient:
             cursor = body.get("response_metadata", {}).get("next_cursor", "")
             if not cursor:
                 raise SlackError(f"channel #{name} not found (or no access)")
+
+    def find_dm(self, user_id: str) -> tuple[str, str]:
+        """Return (DM channel ID, description of the user) for your existing
+        DM with `user_id`."""
+        cursor = ""
+        while True:
+            body = self._post(
+                "conversations.list",
+                {"limit": 1000, "cursor": cursor, "types": "im"},
+            )
+            for ch in body.get("channels", []):
+                if ch.get("user") == user_id:
+                    user = self._post("users.info", {"user": user_id})["user"]
+                    return ch["id"], _describe_user(user)
+            cursor = body.get("response_metadata", {}).get("next_cursor", "")
+            if not cursor:
+                raise SlackError(f"no existing DM with user {user_id}")
 
     def iter_messages(
         self, channel_id: str, latest: str | None = None,
@@ -320,6 +348,12 @@ def _scan_search(
     return scanned
 
 
+def _default_file(args: argparse.Namespace) -> str:
+    if args.dm:
+        return f"dm-{args.dm}.jsonl"
+    return f"{args.channel.lstrip('#')}.jsonl"
+
+
 def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
     me = slack.auth_test()
     user_id = me["user_id"]
@@ -330,11 +364,16 @@ def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
         since_ts = _parse_since(args.since)
         print(f"Only scanning messages with ts >= {since_ts}")
 
-    channel_id = slack.find_channel_id(args.channel)
-    channel_name = args.channel.lstrip("#")
-    print(f"Channel #{channel_name} -> {channel_id}")
+    if args.dm:
+        channel_id, who = slack.find_dm(args.dm)
+        print(f"DM with {who} -> {channel_id}")
+        # Search may not support DMs reliably; read the whole conversation.
+        args.full = True
+    else:
+        channel_id = slack.find_channel_id(args.channel)
+        print(f"Channel #{args.channel.lstrip('#')} -> {channel_id}")
 
-    out_path = Path(args.output or f"{channel_name}.jsonl")
+    out_path = Path(args.output or _default_file(args))
 
     # Resume support: infer the point from the existing JSONL.
     # `conversations.history` walks newest -> oldest, so the smallest main-timeline
@@ -469,7 +508,7 @@ def _parse_delay(spec: str) -> tuple[float, float]:
 
 
 def cmd_delete(args: argparse.Namespace, slack: SlackClient) -> int:
-    path = Path(args.file or f"{args.channel.lstrip('#')}.jsonl")
+    path = Path(args.file or _default_file(args))
     if not path.exists():
         print(f"ERROR: {path} not found; run scan first", file=sys.stderr)
         return 2
@@ -573,6 +612,12 @@ def main() -> int:
         "--channel", default=os.environ.get("SLACK_CHANNEL"),
         help="Channel name, e.g. my-channel (env: SLACK_CHANNEL)",
     )
+    ps.add_argument(
+        "--dm",
+        help="Scan your DM with this user ID (e.g. U0123ABCD) instead of a "
+             "channel; writes dm-<user ID>.jsonl and "
+             "always reads the whole conversation",
+    )
     ps.add_argument("-o", "--output", help="Output JSONL path (default <channel>.jsonl)")
     ps.add_argument("--overwrite", action="store_true")
     ps.add_argument(
@@ -595,6 +640,10 @@ def main() -> int:
         help="Channel name; deletes from <channel>.jsonl (env: SLACK_CHANNEL)",
     )
     pd.add_argument(
+        "--dm",
+        help="Delete from dm-<user ID>.jsonl (produced by scan --dm <user ID>)",
+    )
+    pd.add_argument(
         "--file",
         help="JSONL produced by scan, if it isn't <channel>.jsonl (scan -o)",
     )
@@ -615,11 +664,19 @@ def main() -> int:
     if not args.workspace:
         print("ERROR: --workspace or SLACK_WORKSPACE is required", file=sys.stderr)
         return 2
-    if args.cmd == "scan" and not args.channel:
-        print("ERROR: scan: --channel or SLACK_CHANNEL is required", file=sys.stderr)
+    if args.cmd == "scan" and not (args.channel or args.dm):
+        print("ERROR: scan: --channel, --dm or SLACK_CHANNEL is required", file=sys.stderr)
         return 2
-    if args.cmd == "delete" and not (args.channel or args.file):
-        print("ERROR: delete: --channel or SLACK_CHANNEL is required", file=sys.stderr)
+    if args.cmd == "delete" and not (args.channel or args.file or args.dm):
+        print("ERROR: delete: --channel, --dm or SLACK_CHANNEL is required", file=sys.stderr)
+        return 2
+
+    if args.dm and not re.fullmatch(r"[UW][A-Z0-9]{2,}", args.dm):
+        print(
+            f"ERROR: --dm takes a Slack user ID like U0123ABCD, got {args.dm!r} "
+            f"(profile -> ⋮ -> Copy member ID)",
+            file=sys.stderr,
+        )
         return 2
 
     token = os.environ.get("SLACK_TOKEN")
