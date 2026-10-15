@@ -1,10 +1,11 @@
 """Delete all of your own messages in a Slack channel using browser session tokens.
 
-Two subcommands:
+Three subcommands:
   scan    - find all your message IDs in a channel (via Slack search, or the
             whole channel history with --full), save to a JSONL file; with
             --dm <user ID>, scan your direct messages with that person instead
   delete  - read the channel's JSONL file and delete each message, marking progress
+  stats   - count your messages per channel / DM (via Slack search), top first
 
 Uses the unofficial xoxc token + `d` cookie from a logged-in Slack web session.
 This is against Slack's Terms of Service; use at your own risk.
@@ -87,6 +88,7 @@ class SlackClient:
             },
         )
         self._last_call: dict[str, float] = {}
+        self.search_capped = False
 
     def close(self) -> None:
         self.client.close()
@@ -216,8 +218,12 @@ class SlackClient:
             if not cursor:
                 return
 
-    def iter_search(self, query: str) -> Iterator[dict[str, Any]]:
-        """Yield `search.messages` matches, newest first."""
+    def iter_search(
+        self, query: str, warn_cap: bool = True,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield `search.messages` matches, newest first. Sets
+        `self.search_capped` if Slack's page limit cut the results short."""
+        self.search_capped = False
         cursor = "*"
         page = 1
         while True:
@@ -250,6 +256,9 @@ class SlackClient:
                 return
             page += 1
             if page > 100:
+                self.search_capped = True
+                if not warn_cap:
+                    return
                 print(
                     "  WARNING: search results capped at 100 pages; re-run with "
                     "an older --since window or with --full to get the rest",
@@ -263,10 +272,14 @@ class SlackClient:
 
 # ---------- scan ----------
 
-def _parse_since(spec: str) -> str:
-    """Return a Slack ts string ('seconds.microseconds') from either a raw ts
-    or a local-time date/datetime like '2024-01-15' or '2024-01-15T10:00:00'."""
+def _parse_time(spec: str, flag: str) -> str:
+    """Return a Slack ts string ('seconds.microseconds') from a raw ts, a
+    local-time date/datetime like '2024-01-15' or '2024-01-15T10:00:00', or a
+    number of days ago like '30d'."""
     s = spec.strip()
+    if s[:-1].isdigit() and s[-1:].lower() == "d":
+        dt = datetime.now().astimezone() - timedelta(days=int(s[:-1]))
+        return f"{dt.timestamp():.6f}"
     # Already a slack ts.
     if "." in s and s.replace(".", "").isdigit():
         return s
@@ -280,9 +293,44 @@ def _parse_since(spec: str) -> str:
         except ValueError:
             continue
     raise ValueError(
-        f"--since {spec!r}: use a Slack ts (1700000000.000000) or a date like "
-        f"2024-01-15 / 2024-01-15T10:00:00"
+        f"{flag} {spec!r}: use a Slack ts (1700000000.000000), a date like "
+        f"2024-01-15 / 2024-01-15T10:00:00, or a number of days ago like 30d"
     )
+
+
+def _time_window(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    """Parse --since / --till into (since_ts, till_ts) and say what they mean."""
+    since_ts = _parse_time(args.since, "--since") if args.since else None
+    till_ts = _parse_time(args.till, "--till") if args.till else None
+    if since_ts:
+        print(f"Only messages from {_fmt_ts(since_ts)} on")
+    if till_ts:
+        print(f"Only messages before {_fmt_ts(till_ts)}")
+    return since_ts, till_ts
+
+
+def _fmt_ts(ts: str) -> str:
+    return f"{datetime.fromtimestamp(float(ts)).astimezone():%Y-%m-%d %H:%M %Z}"
+
+
+def _in_window(ts: str, since_ts: str | None, till_ts: str | None) -> bool:
+    return (since_ts is None or float(ts) >= float(since_ts)) and (
+        till_ts is None or float(ts) < float(till_ts)
+    )
+
+
+def _search_window(since_ts: str | None, till_ts: str | None) -> str:
+    """`after:` / `before:` search modifiers covering the window. They are
+    day-granular, exclusive and evaluated in Slack's idea of your timezone, so
+    this searches a little wider; filter exactly with _in_window."""
+    q = ""
+    if since_ts:
+        day = datetime.fromtimestamp(float(since_ts)) - timedelta(days=2)
+        q += f" after:{day:%Y-%m-%d}"
+    if till_ts:
+        day = datetime.fromtimestamp(float(till_ts)) + timedelta(days=2)
+        q += f" before:{day:%Y-%m-%d}"
+    return q
 
 def _msg_has_image(msg: dict[str, Any]) -> bool:
     for fobj in msg.get("files") or []:
@@ -312,14 +360,10 @@ def _search_thread_ts(match: dict[str, Any]) -> str | None:
 
 def _scan_search(
     slack: SlackClient, channel_id: str, user_id: str, since_ts: str | None,
-    emit: Any,
+    till_ts: str | None, emit: Any,
 ) -> int:
     query = f"from:<@{user_id}> in:<#{channel_id}>"
-    if since_ts:
-        # `after:` is day-granular, exclusive and evaluated in Slack's idea of
-        # your timezone, so search a little wider and filter exactly below.
-        day = datetime.fromtimestamp(float(since_ts)) - timedelta(days=2)
-        query += f" after:{day:%Y-%m-%d}"
+    query += _search_window(since_ts, till_ts)
     print(f"Searching: {query}", flush=True)
 
     scanned = 0
@@ -330,7 +374,7 @@ def _scan_search(
             ts
             and match.get("user") == user_id
             and (match.get("channel") or {}).get("id") == channel_id
-            and (since_ts is None or float(ts) >= float(since_ts))
+            and _in_window(ts, since_ts, till_ts)
         ):
             rec = {"channel": channel_id, "ts": ts}
             thread_ts = _search_thread_ts(match)
@@ -359,10 +403,7 @@ def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
     user_id = me["user_id"]
     print(f"Authenticated as {me.get('user')} ({user_id}) in {me.get('team')}")
 
-    since_ts: str | None = None
-    if args.since:
-        since_ts = _parse_since(args.since)
-        print(f"Only scanning messages with ts >= {since_ts}")
+    since_ts, till_ts = _time_window(args)
 
     if args.dm:
         channel_id, who = slack.find_dm(args.dm)
@@ -438,12 +479,16 @@ def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
             count += 1
 
         if not args.full:
-            scanned = _scan_search(slack, channel_id, user_id, since_ts, emit)
+            scanned = _scan_search(slack, channel_id, user_id, since_ts, till_ts, emit)
             print(f"Saved {count} new message IDs to {out_path} (scanned {scanned} this run)")
             return 0
 
         print("Scanning main timeline...", flush=True)
-        for msg in slack.iter_messages(channel_id, latest=resume_latest, oldest=since_ts):
+        # `latest` is exclusive, so it works both as resume point and as --till.
+        latest = min(
+            (t for t in (resume_latest, till_ts) if t), key=float, default=None,
+        )
+        for msg in slack.iter_messages(channel_id, latest=latest, oldest=since_ts):
             scanned += 1
             if msg.get("user") == user_id:
                 emit({
@@ -457,7 +502,10 @@ def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
             if msg.get("thread_ts") == msg.get("ts") and msg.get("reply_count", 0) > 0:
                 for reply in slack.iter_thread_replies(channel_id, msg["ts"]):
                     scanned += 1
-                    if reply.get("user") == user_id:
+                    # Replies can be newer than their thread's first message.
+                    if reply.get("user") == user_id and _in_window(
+                        reply["ts"], since_ts, till_ts
+                    ):
                         emit({
                             "channel": channel_id,
                             "ts": reply["ts"],
@@ -516,6 +564,14 @@ def cmd_delete(args: argparse.Namespace, slack: SlackClient) -> int:
     records = _load_records(path)
     pending = [r for r in records if not r.get("deleted")]
 
+    skipped_new = 0
+    if args.till:
+        till_ts = _parse_time(args.till, "--till")
+        print(f"Only deleting messages before {_fmt_ts(till_ts)}")
+        kept = [r for r in pending if float(r["ts"]) < float(till_ts)]
+        skipped_new = len(pending) - len(kept)
+        pending = kept
+
     skipped_media = 0
     if args.skip_media:
         kept = []
@@ -528,10 +584,12 @@ def cmd_delete(args: argparse.Namespace, slack: SlackClient) -> int:
 
     # Delete oldest first (ts is a Slack "seconds.microseconds" string; float() sorts fine).
     pending.sort(key=lambda r: float(r["ts"]))
-    already = len(records) - (len(pending) + skipped_media)
+    already = len(records) - (len(pending) + skipped_media + skipped_new)
     print(
         f"{len(records)} total, {already} already deleted, "
-        f"{skipped_media} skipped (media), {len(pending)} pending (oldest first)"
+        f"{skipped_media} skipped (media), "
+        + (f"{skipped_new} skipped (not before --till), " if args.till else "")
+        + f"{len(pending)} pending (oldest first)"
     )
 
     if args.dry_run or not pending:
@@ -571,6 +629,80 @@ def cmd_delete(args: argparse.Namespace, slack: SlackClient) -> int:
     deleted = sum(1 for r in records if r.get("deleted"))
     print(f"Done. deleted_total={deleted} failed_this_run={failed}")
     return 0 if failed == 0 else 1
+
+
+# ---------- stats ----------
+
+def _conversation_label(ch: dict[str, Any]) -> str:
+    if ch.get("is_im"):
+        return f"DM {ch.get('name')}"  # a DM's search "name" is the user ID
+    if ch.get("is_mpim"):
+        return f"group DM {ch.get('name')}"
+    prefix = "🔒" if ch.get("is_private") or ch.get("is_group") else "#"
+    return f"{prefix}{ch.get('name')}"
+
+
+def cmd_stats(args: argparse.Namespace, slack: SlackClient) -> int:
+    me = slack.auth_test()
+    user_id = me["user_id"]
+    print(f"Authenticated as {me.get('user')} ({user_id}) in {me.get('team')}")
+
+    since_ts, till_ts = _time_window(args)
+    base = f"from:<@{user_id}>" + _search_window(since_ts, None)
+
+    seen: set[tuple[str, str]] = set()
+    counts: dict[str, int] = {}
+    labels: dict[str, str] = {}
+    before: datetime | None = None
+    if till_ts:
+        before = datetime.fromtimestamp(float(till_ts)) + timedelta(days=2)
+    # Slack stops returning results after ~100 pages, so whenever a pass is cut
+    # short, search again for messages older than the oldest one seen. `before:` is
+    # day-granular and timezone-fuzzy, so the windows overlap a little and
+    # dedup handles that; a pass with nothing new moves back a day.
+    while True:
+        query = base + (f" before:{before:%Y-%m-%d}" if before else "")
+        print(f"Searching: {query}", flush=True)
+        new = 0
+        hits = 0
+        for match in slack.iter_search(query, warn_cap=False):
+            hits += 1
+            ch = match.get("channel") or {}
+            ts = match.get("ts")
+            if not ts or not ch.get("id") or match.get("user") != user_id:
+                continue
+            if not _in_window(ts, since_ts, till_ts):
+                continue
+            key = (ch["id"], ts)
+            if key in seen:
+                continue
+            seen.add(key)
+            new += 1
+            counts[ch["id"]] = counts.get(ch["id"], 0) + 1
+            labels.setdefault(ch["id"], _conversation_label(ch))
+            if len(seen) % 1000 == 0:
+                print(f"  counted={len(seen)}", flush=True)
+        if not hits or (new and not slack.search_capped):
+            break
+        if new:
+            oldest = min(float(ts) for _, ts in seen)
+            before = datetime.fromtimestamp(oldest) + timedelta(days=2)
+        elif before:
+            before -= timedelta(days=1)
+        else:
+            break
+
+    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    shown = ranked[: args.top] if args.top else ranked
+    print()
+    print(
+        f"{len(seen)} messages in {len(counts)} conversations"
+        + (f" (top {len(shown)})" if len(shown) < len(ranked) else "")
+    )
+    width = len(str(shown[0][1])) if shown else 1
+    for rank, (cid, n) in enumerate(shown, 1):
+        print(f"{rank:>4}. {n:>{width}}  {labels[cid]}  ({cid})")
+    return 0
 
 
 # ---------- entrypoint ----------
@@ -631,7 +763,13 @@ def main() -> int:
         "--since", default=os.environ.get("SLACK_SINCE"),
         help="Only scan messages at or after this time. Accepts a Slack ts "
              "(e.g. 1700000000.000000) or a local date/datetime "
-             "(2024-01-15 or 2024-01-15T10:00:00). (env: SLACK_SINCE)",
+             "(2024-01-15 or 2024-01-15T10:00:00), or days ago (30d). "
+             "(env: SLACK_SINCE)",
+    )
+    ps.add_argument(
+        "--till", default=os.environ.get("SLACK_TILL"),
+        help="Only messages before this time, e.g. 30d to leave the last 30 "
+             "days alone. Same formats as --since. (env: SLACK_TILL)",
     )
 
     pd = sub.add_parser("delete", help="Delete messages listed in a JSONL file")
@@ -647,6 +785,11 @@ def main() -> int:
         "--file",
         help="JSONL produced by scan, if it isn't <channel>.jsonl (scan -o)",
     )
+    pd.add_argument(
+        "--till", default=os.environ.get("SLACK_TILL"),
+        help="Only messages before this time, e.g. 30d to leave the last 30 "
+             "days alone. Same formats as --since. (env: SLACK_TILL)",
+    )
     pd.add_argument("--dry-run", action="store_true")
     pd.add_argument("--yes", action="store_true")
     pd.add_argument(
@@ -657,6 +800,22 @@ def main() -> int:
         "--delay", default="1.1-1.4",
         help="Seconds between deletes: single float (e.g. 4) or range 'MIN-MAX' "
              "for uniform random sleep (default '1.1-1.4', ~45/min)",
+    )
+
+    pt = sub.add_parser("stats", help="Count your messages per channel / DM")
+    pt.add_argument(
+        "--since", default=os.environ.get("SLACK_SINCE"),
+        help="Only count messages at or after this time (same formats as "
+             "scan --since). (env: SLACK_SINCE)",
+    )
+    pt.add_argument(
+        "--till", default=os.environ.get("SLACK_TILL"),
+        help="Only messages before this time, e.g. 30d to leave the last 30 "
+             "days alone. Same formats as --since. (env: SLACK_TILL)",
+    )
+    pt.add_argument(
+        "--top", type=int, default=30,
+        help="How many conversations to list (default 30, 0 = all)",
     )
 
     args = p.parse_args()
@@ -671,7 +830,7 @@ def main() -> int:
         print("ERROR: delete: --channel, --dm or SLACK_CHANNEL is required", file=sys.stderr)
         return 2
 
-    if args.dm and not re.fullmatch(r"[UW][A-Z0-9]{2,}", args.dm):
+    if getattr(args, "dm", None) and not re.fullmatch(r"[UW][A-Z0-9]{2,}", args.dm):
         print(
             f"ERROR: --dm takes a Slack user ID like U0123ABCD, got {args.dm!r} "
             f"(profile -> ⋮ -> Copy member ID)",
@@ -691,6 +850,8 @@ def main() -> int:
             return cmd_scan(args, slack)
         if args.cmd == "delete":
             return cmd_delete(args, slack)
+        if args.cmd == "stats":
+            return cmd_stats(args, slack)
         return 2
     finally:
         slack.close()
