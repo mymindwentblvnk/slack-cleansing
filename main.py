@@ -136,7 +136,7 @@ class SlackClient:
     def auth_test(self) -> dict[str, Any]:
         return self._post("auth.test", {})
 
-    def find_channel_id(self, name: str) -> str:
+    def find_channel(self, name: str) -> dict[str, Any]:
         name = name.lstrip("#")
         cursor = ""
         while True:
@@ -146,12 +146,12 @@ class SlackClient:
                     "limit": 1000,
                     "cursor": cursor,
                     "types": "public_channel,private_channel",
-                    "exclude_archived": "true",
+                    "exclude_archived": "false",
                 },
             )
             for ch in body.get("channels", []):
                 if ch.get("name") == name:
-                    return ch["id"]
+                    return ch
             cursor = body.get("response_metadata", {}).get("next_cursor", "")
             if not cursor:
                 raise SlackError(f"channel #{name} not found (or no access)")
@@ -411,8 +411,10 @@ def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
         # Search may not support DMs reliably; read the whole conversation.
         args.full = True
     else:
-        channel_id = slack.find_channel_id(args.channel)
-        print(f"Channel #{args.channel.lstrip('#')} -> {channel_id}")
+        channel = slack.find_channel(args.channel)
+        channel_id = channel["id"]
+        archived = " (archived)" if channel.get("is_archived") else ""
+        print(f"Channel #{args.channel.lstrip('#')} -> {channel_id}{archived}")
 
     out_path = Path(args.output or _default_file(args))
 
