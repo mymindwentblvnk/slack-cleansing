@@ -1,9 +1,9 @@
 """Delete all of your own messages in a Slack channel using browser session tokens.
 
 Three subcommands:
-  scan    - find all your message IDs in a channel (via Slack search, or the
-            whole channel history with --full), save to a JSONL file; with
-            --dm <user ID>, scan your direct messages with that person instead
+  scan    - find all your message IDs in a channel (via Slack search), save
+            to a JSONL file; with --dm <user ID>, scan your direct messages
+            with that person instead (reading the whole conversation)
   delete  - read the channel's JSONL file and delete each message, marking progress
   stats   - count your messages per channel / DM (via Slack search), top first
 
@@ -195,7 +195,7 @@ class SlackClient:
                 return
 
     def iter_thread_replies(
-        self, channel_id: str, thread_ts: str
+        self, channel_id: str, thread_ts: str, include_parent: bool = False,
     ) -> Iterator[dict[str, Any]]:
         cursor = ""
         while True:
@@ -209,7 +209,7 @@ class SlackClient:
                 },
             )
             for msg in body.get("messages", []):
-                if msg.get("ts") == thread_ts:
+                if msg.get("ts") == thread_ts and not include_parent:
                     continue
                 yield msg
             if not body.get("has_more"):
@@ -261,7 +261,7 @@ class SlackClient:
                     return
                 print(
                     "  WARNING: search results capped at 100 pages; re-run with "
-                    "an older --since window or with --full to get the rest",
+                    "an older --since window to get the rest",
                     file=sys.stderr,
                 )
                 return
@@ -392,10 +392,49 @@ def _scan_search(
     return scanned
 
 
+def _scan_thread(
+    slack: SlackClient, channel_id: str, thread_ts: str, user_id: str,
+    since_ts: str | None, till_ts: str | None, emit: Any,
+) -> int:
+    print(f"Reading thread {thread_ts} ({_fmt_ts(thread_ts)})...", flush=True)
+    scanned = 0
+    for msg in slack.iter_thread_replies(channel_id, thread_ts, include_parent=True):
+        scanned += 1
+        if msg.get("user") != user_id or not _in_window(msg["ts"], since_ts, till_ts):
+            continue
+        rec = {"channel": channel_id, "ts": msg["ts"]}
+        if msg["ts"] != thread_ts:
+            rec["thread_ts"] = thread_ts
+        emit({
+            **rec,
+            "text_preview": (msg.get("text", "") or "")[:120],
+            "has_image": _msg_has_image(msg),
+            "has_video": _msg_has_video(msg),
+            "deleted": False,
+        })
+    return scanned
+
+
+def _parse_thread(spec: str) -> str:
+    """Accept a Slack ts (1700000000.000100) or the p-form from a message link
+    (p1700000000000100)."""
+    s = spec.strip()
+    if re.fullmatch(r"\d+\.\d+", s):
+        return s
+    m = re.fullmatch(r"p(\d{10})(\d{6})", s)
+    if m:
+        return f"{m[1]}.{m[2]}"
+    raise ValueError(
+        f"--thread {spec!r}: use the thread's ts (1700000000.000100) or the "
+        f"p-number from its link (p1700000000000100)"
+    )
+
+
 def _default_file(args: argparse.Namespace) -> str:
-    if args.dm:
-        return f"dm-{args.dm}.jsonl"
-    return f"{args.channel.lstrip('#')}.jsonl"
+    base = f"dm-{args.dm}" if args.dm else args.channel.lstrip("#")
+    if args.thread:
+        base += f"-thread-{args.thread}"
+    return f"{base}.jsonl"
 
 
 def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
@@ -409,12 +448,29 @@ def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
         channel_id, who = slack.find_dm(args.dm)
         print(f"DM with {who} -> {channel_id}")
         # Search may not support DMs reliably; read the whole conversation.
-        args.full = True
     else:
         channel = slack.find_channel(args.channel)
         channel_id = channel["id"]
         archived = " (archived)" if channel.get("is_archived") else ""
         print(f"Channel #{args.channel.lstrip('#')} -> {channel_id}{archived}")
+
+    full = bool(args.dm) and not args.thread
+
+    if args.thread:
+        # Check before creating the output file: an empty file would make
+        # `delete` skip its automatic scan.
+        body = slack._post(
+            "conversations.replies",
+            {"channel": channel_id, "ts": args.thread, "limit": 1},
+        )
+        first = (body.get("messages") or [{}])[0]
+        if first.get("thread_ts", args.thread) != args.thread:
+            print(
+                f"ERROR: {args.thread} is a reply, not the start of a thread; "
+                f"use THREAD={first['thread_ts']} (the thread's first message)",
+                file=sys.stderr,
+            )
+            return 2
 
     out_path = Path(args.output or _default_file(args))
 
@@ -449,8 +505,9 @@ def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
                             oldest_main = ts
             resume_latest = oldest_main
             mode = "a"
-            if not args.full:
-                # Search only returns your own messages, so a full re-run is cheap.
+            if not full:
+                # Search only returns your own messages, and a thread is short,
+                # so a full re-run is cheap.
                 resume_latest = None
                 print(
                     f"{out_path} exists with {len(existing_ts)} records; "
@@ -480,7 +537,14 @@ def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
             f.flush()
             count += 1
 
-        if not args.full:
+        if args.thread:
+            scanned = _scan_thread(
+                slack, channel_id, args.thread, user_id, since_ts, till_ts, emit,
+            )
+            print(f"Saved {count} new message IDs to {out_path} (scanned {scanned} this run)")
+            return 0
+
+        if not full:
             scanned = _scan_search(slack, channel_id, user_id, since_ts, till_ts, emit)
             print(f"Saved {count} new message IDs to {out_path} (scanned {scanned} this run)")
             return 0
@@ -559,9 +623,35 @@ def _parse_delay(spec: str) -> tuple[float, float]:
 
 def cmd_delete(args: argparse.Namespace, slack: SlackClient) -> int:
     path = Path(args.file or _default_file(args))
+    scanned_now = False
     if not path.exists():
-        print(f"ERROR: {path} not found; run scan first", file=sys.stderr)
-        return 2
+        if args.file:
+            print(f"ERROR: {path} not found; run scan first", file=sys.stderr)
+            return 2
+        bar = "!" * 72
+        print(
+            f"{bar}\n"
+            f"!!  WARNING: {path} not found -- no scan was run for this target.\n"
+            + (
+                f"!!  Running a scan first (dry run: nothing will be deleted).\n"
+                if args.dry_run else
+                f"!!  Running a scan first; you'll be asked to confirm before\n"
+                f"!!  anything is deleted.\n"
+            )
+            + f"{bar}",
+            flush=True,
+        )
+        scan_args = argparse.Namespace(
+            **vars(args), output=None, overwrite=False,
+            since=os.environ.get("SLACK_SINCE"),
+        )
+        rc = cmd_scan(scan_args, slack)
+        if rc != 0:
+            return rc
+        if not path.exists():
+            print(f"ERROR: scan didn't write {path}", file=sys.stderr)
+            return 2
+        scanned_now = True
 
     records = _load_records(path)
     pending = [r for r in records if not r.get("deleted")]
@@ -599,7 +689,8 @@ def cmd_delete(args: argparse.Namespace, slack: SlackClient) -> int:
             print(f"  would delete ts={r['ts']}  {r.get('text_preview','')!r}")
         return 0
 
-    if not args.yes:
+    # A scan that just ran was never reviewed, so always ask, even with --yes.
+    if scanned_now or not args.yes:
         reply = input(f"Delete {len(pending)} messages? [y/N] ").strip().lower()
         if reply != "y":
             print("Aborted.")
@@ -752,15 +843,13 @@ def main() -> int:
              "channel; writes dm-<user ID>.jsonl and "
              "always reads the whole conversation",
     )
+    ps.add_argument(
+        "--thread",
+        help="Only this thread of the channel / DM: the thread's ts "
+             "(1700000000.000100) or the p-number from its link; writes <channel>-thread-<ts>.jsonl",
+    )
     ps.add_argument("-o", "--output", help="Output JSONL path (default <channel>.jsonl)")
     ps.add_argument("--overwrite", action="store_true")
-    ps.add_argument(
-        "--full", action="store_true",
-        help="Read the whole channel history (and every thread) instead of "
-             "finding your messages via Slack search (from:me in:channel). "
-             "Much slower on big channels, but doesn't rely on Slack's search "
-             "index.",
-    )
     ps.add_argument(
         "--since", default=os.environ.get("SLACK_SINCE"),
         help="Only scan messages at or after this time. Accepts a Slack ts "
@@ -782,6 +871,11 @@ def main() -> int:
     pd.add_argument(
         "--dm",
         help="Delete from dm-<user ID>.jsonl (produced by scan --dm <user ID>)",
+    )
+    pd.add_argument(
+        "--thread",
+        help="Only this thread of the channel / DM: the thread's ts "
+             "(1700000000.000100) or the p-number from its link; reads <channel>-thread-<ts>.jsonl",
     )
     pd.add_argument(
         "--file",
@@ -831,6 +925,20 @@ def main() -> int:
     if args.cmd == "delete" and not (args.channel or args.file or args.dm):
         print("ERROR: delete: --channel, --dm or SLACK_CHANNEL is required", file=sys.stderr)
         return 2
+
+    if getattr(args, "thread", None):
+        if not (args.channel or args.dm):
+            print(
+                "ERROR: --thread needs --channel or --dm: a ts only identifies "
+                "a thread within one conversation",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            args.thread = _parse_thread(args.thread)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
 
     if getattr(args, "dm", None) and not re.fullmatch(r"[UW][A-Z0-9]{2,}", args.dm):
         print(

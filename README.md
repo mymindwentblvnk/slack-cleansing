@@ -1,12 +1,8 @@
-# slack-delete
+# slack-cleansing
 
 Delete all of your own messages in a single Slack channel, or in your direct
 messages with one person, using browser session tokens extracted from a
 logged-in Slack web session.
-
-> **Warning**: This uses the unofficial `xoxc` token + `d` cookie flow. It is
-> against Slack's Terms of Service. Use at your own risk on workspaces where
-> you're allowed to do so.
 
 ## Quick start
 
@@ -45,12 +41,12 @@ Options, passed as `make <command> NAME=value`:
 | `CHANNEL=name` | scan, dry-run, delete | Channel to work on. Defaults to `SLACK_CHANNEL` from `.env`.      |
 | `SINCE=date`   | scan, stats         | Only collect messages from this point on, e.g. `2024-01-15`.        |
 | `TILL=date`    | scan, dry-run, delete, stats | Only messages before this point, e.g. `2026-09-01`, or `30d` for "keep the last 30 days". |
-| `FULL=1`       | scan                | Read the whole channel history instead of using search. Slow but exhaustive. |
 | `SKIP_MEDIA=1` | dry-run, delete     | Leave messages with a picture or video attachment alone.            |
 | `YES=1`        | delete              | Skip the confirmation prompt.                                       |
 | `DELAY=1.1-1.4`| delete              | Seconds to wait between deletes; a number or a `MIN-MAX` range.     |
 | `TOP=30`       | stats               | How many conversations to list; `0` lists all.                      |
 | `DM=userID`    | scan, dry-run, delete | Work on your DM with this user (e.g. `U0123ABCD`) instead of a channel; uses `dm-<userID>.jsonl`. |
+| `THREAD=ts`    | scan, dry-run, delete | Only one thread of `CHANNEL` / `DM`, by its timestamp; uses `<channel>-thread-<ts>.jsonl`. |
 
 See [Get your Slack credentials](#get-your-slack-credentials) for the `.env`
 values and [Usage](#usage) for details on each step.
@@ -167,17 +163,8 @@ By default scan asks Slack's search for just your messages
 This depends on Slack's search index: very recent messages may not be indexed
 yet, and free workspaces only search the last 90 days.
 
-Add `FULL=1` to read the whole channel (and every thread) instead and keep what
-is yours. That is slow on big channels but exhaustive — both modes dedupe into
-the same file, so you can run it after a search scan to catch stragglers:
-
-```sh
-make scan CHANNEL=my-channel FULL=1
-```
-
 If the target file already exists, new records are appended and deduped by
-`ts`. With `FULL=1` scan also **resumes**: it finds the oldest main-timeline
-`ts` in the file and continues fetching older messages from there.
+`ts`.
 
 Add `TILL=` to only collect messages *before* a point in time — e.g. to keep
 the last month:
@@ -209,6 +196,10 @@ Prompts for confirmation, then deletes each message and marks it
 progress survives a crash — re-running the same command resumes where it left
 off.
 
+If there's no `<channel>.jsonl` yet, `delete` (and `dry-run`) prints a warning
+and runs a search scan first, honouring `TILL` and `SLACK_SINCE`. After that
+scan, `delete` always asks before deleting, even with `YES=1`.
+
 Variables for `make delete` / `make dry-run`:
 
 - `TILL=30d` / `TILL=2026-09-15` — only delete messages before that point. This
@@ -235,9 +226,42 @@ unique. To find it, open their profile in Slack → **⋮** → **Copy member ID
 Only an existing DM is used, and the scan prints who it belongs to.
 
 For a DM, `scan` always reads the whole conversation (including threads)
-rather than using search, as if `FULL=1` were set, and writes
-`dm-<DM>.jsonl`; `dry-run` and `delete` read that file. All other options work
-as for channels.
+rather than using search, and writes `dm-<DM>.jsonl`; `dry-run` and `delete`
+read that file. If the file already exists, scan **resumes**: it continues with
+messages older than the oldest one saved. All other options work as for
+channels.
+
+### A single thread
+
+Add `THREAD=` to `CHANNEL=` or `DM=` to work on just one thread:
+
+```sh
+make scan CHANNEL=my-channel THREAD=1700000000.000100
+make dry-run CHANNEL=my-channel THREAD=1700000000.000100
+make delete CHANNEL=my-channel THREAD=1700000000.000100
+```
+
+`THREAD=` takes the `ts` of the thread's first message. To find it:
+
+1. Hover over the thread's **first message** (the one in the channel, not a
+   reply) → **⋮** → **Copy link**.
+2. The link looks like
+   `https://acme-corp.slack.com/archives/C0123ABCD/p1700000000000100`. Pass
+   the last part as-is: `THREAD=p1700000000000100` is the same as
+   `THREAD=1700000000.000100`.
+
+If you copied a reply's link instead, it ends in
+`?thread_ts=1700000000.000100&cid=...`; the `thread_ts` value is the one to
+use. Passing a reply's own ts makes `scan` stop and print the right `THREAD=`.
+
+A timestamp only identifies a thread within one conversation, so `CHANNEL=` or
+`DM=` is required.
+
+`scan` reads the whole thread (no search) and keeps your messages in it,
+including the first message if it's yours, and writes
+`<channel>-thread-<ts>.jsonl` (`dm-<userID>-thread-<ts>.jsonl` for a DM).
+Deleting a thread's first message leaves the replies in place, under a
+"This message was deleted." placeholder. All other options work as usual.
 
 ### Where have I posted?
 
