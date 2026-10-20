@@ -1,11 +1,8 @@
-# slack-delete
+# slack-cleansing
 
-Delete all of your own messages in a single Slack channel, using browser session
-tokens extracted from a logged-in Slack web session.
-
-> **Warning**: This uses the unofficial `xoxc` token + `d` cookie flow. It is
-> against Slack's Terms of Service. Use at your own risk on workspaces where
-> you're allowed to do so.
+Delete all of your own messages in a single Slack channel, or in your direct
+messages with one person, using browser session tokens extracted from a
+logged-in Slack web session.
 
 ## Quick start
 
@@ -32,6 +29,7 @@ All commands:
 | `make scan`    | Find your messages in a channel and save their IDs to `<channel>.jsonl`.     |
 | `make dry-run` | List what `delete` would remove from `<channel>.jsonl`, without touching Slack. |
 | `make delete`  | Delete the messages listed in `<channel>.jsonl`, after a confirmation prompt. |
+| `make stats`   | List the channels and DMs you've posted in, most messages first.            |
 | `make shell`   | Open a shell inside the image, for debugging.                                |
 | `make clean`   | Remove the Docker image.                                                     |
 | `make help`    | Print the targets and variables.                                             |
@@ -41,11 +39,14 @@ Options, passed as `make <command> NAME=value`:
 | Option         | Commands            | What it does                                                        |
 |----------------|---------------------|---------------------------------------------------------------------|
 | `CHANNEL=name` | scan, dry-run, delete | Channel to work on. Defaults to `SLACK_CHANNEL` from `.env`.      |
-| `SINCE=date`   | scan                | Only collect messages from this point on, e.g. `2024-01-15`.        |
-| `FULL=1`       | scan                | Read the whole channel history instead of using search. Slow but exhaustive. |
+| `SINCE=date`   | scan, stats         | Only collect messages from this point on, e.g. `2024-01-15`.        |
+| `TILL=date`    | scan, dry-run, delete, stats | Only messages before this point, e.g. `2026-09-01`, or `30d` for "keep the last 30 days". |
 | `SKIP_MEDIA=1` | dry-run, delete     | Leave messages with a picture or video attachment alone.            |
 | `YES=1`        | delete              | Skip the confirmation prompt.                                       |
 | `DELAY=1.1-1.4`| delete              | Seconds to wait between deletes; a number or a `MIN-MAX` range.     |
+| `TOP=30`       | stats               | How many conversations to list; `0` lists all.                      |
+| `DM=userID`    | scan, dry-run, delete | Work on your DM with this user (e.g. `U0123ABCD`) instead of a channel; uses `dm-<userID>.jsonl`. |
+| `THREAD=ts`    | scan, dry-run, delete | Only one thread of `CHANNEL` / `DM`, by its timestamp; uses `<channel>-thread-<ts>.jsonl`. |
 
 See [Get your Slack credentials](#get-your-slack-credentials) for the `.env`
 values and [Usage](#usage) for details on each step.
@@ -78,6 +79,7 @@ The tool reads `.env` from the current directory. Supported keys:
 | `SLACK_COOKIE_D` | yes      | Value of the `d` cookie (`xoxd-...`)                |
 | `SLACK_CHANNEL`  | no       | Default `CHANNEL=` for `make scan` / `make delete`  |
 | `SLACK_SINCE`    | no       | Default `SINCE=` for `make scan`                    |
+| `SLACK_TILL`     | no       | Default `TILL=` for scan, dry-run, delete and stats |
 
 Make variables (`CHANNEL=`, `SINCE=`, etc.) override the matching env var. See
 `.env.example`.
@@ -161,17 +163,19 @@ By default scan asks Slack's search for just your messages
 This depends on Slack's search index: very recent messages may not be indexed
 yet, and free workspaces only search the last 90 days.
 
-Add `FULL=1` to read the whole channel (and every thread) instead and keep what
-is yours. That is slow on big channels but exhaustive — both modes dedupe into
-the same file, so you can run it after a search scan to catch stragglers:
+If the target file already exists, new records are appended and deduped by
+`ts`.
+
+Add `TILL=` to only collect messages *before* a point in time — e.g. to keep
+the last month:
 
 ```sh
-make scan CHANNEL=my-channel FULL=1
+make scan CHANNEL=my-channel TILL=30d
+# or: TILL=2026-09-15  (that day's messages are kept)
 ```
 
-If the target file already exists, new records are appended and deduped by
-`ts`. With `FULL=1` scan also **resumes**: it finds the oldest main-timeline
-`ts` in the file and continues fetching older messages from there.
+`TILL` and `SINCE` take the same formats, including `<N>d` for "N days ago",
+and can be combined.
 
 ### 2. Dry-run (recommended)
 
@@ -192,13 +196,94 @@ Prompts for confirmation, then deletes each message and marks it
 progress survives a crash — re-running the same command resumes where it left
 off.
 
+If there's no `<channel>.jsonl` yet, `delete` (and `dry-run`) prints a warning
+and runs a search scan first, honouring `TILL` and `SLACK_SINCE`. After that
+scan, `delete` always asks before deleting, even with `YES=1`.
+
 Variables for `make delete` / `make dry-run`:
 
+- `TILL=30d` / `TILL=2026-09-15` — only delete messages before that point. This
+  also applies to a file scanned without `TILL`, so it's a safe way to keep
+  recent messages; pass the same value to `dry-run` and `delete`.
 - `SKIP_MEDIA=1` — don't delete messages with a picture or video attachment
 - `YES=1` — skip the confirmation prompt
 - `DELAY=1.1-1.4` — seconds between deletes; single float (e.g. `4`) or
   `MIN-MAX` range for uniform random sleep (default `1.1-1.4`, ~45/min, just
   under Slack's Tier 3 limit; 429s are handled with backoff)
+
+### Direct messages with one person
+
+Use `DM=` instead of `CHANNEL=` with the same commands:
+
+```sh
+make scan DM=U0123ABCD
+make dry-run DM=U0123ABCD
+make delete DM=U0123ABCD
+```
+
+`DM=` takes the person's Slack user ID (`U0123ABCD`), since names aren't
+unique. To find it, open their profile in Slack → **⋮** → **Copy member ID**.
+Only an existing DM is used, and the scan prints who it belongs to.
+
+For a DM, `scan` always reads the whole conversation (including threads)
+rather than using search, and writes `dm-<DM>.jsonl`; `dry-run` and `delete`
+read that file. If the file already exists, scan **resumes**: it continues with
+messages older than the oldest one saved. All other options work as for
+channels.
+
+### A single thread
+
+Add `THREAD=` to `CHANNEL=` or `DM=` to work on just one thread:
+
+```sh
+make scan CHANNEL=my-channel THREAD=1700000000.000100
+make dry-run CHANNEL=my-channel THREAD=1700000000.000100
+make delete CHANNEL=my-channel THREAD=1700000000.000100
+```
+
+`THREAD=` takes the `ts` of the thread's first message. To find it:
+
+1. Hover over the thread's **first message** (the one in the channel, not a
+   reply) → **⋮** → **Copy link**.
+2. The link looks like
+   `https://acme-corp.slack.com/archives/C0123ABCD/p1700000000000100`. Pass
+   the last part as-is: `THREAD=p1700000000000100` is the same as
+   `THREAD=1700000000.000100`.
+
+If you copied a reply's link instead, it ends in
+`?thread_ts=1700000000.000100&cid=...`; the `thread_ts` value is the one to
+use. Passing a reply's own ts makes `scan` stop and print the right `THREAD=`.
+
+A timestamp only identifies a thread within one conversation, so `CHANNEL=` or
+`DM=` is required.
+
+`scan` reads the whole thread (no search) and keeps your messages in it,
+including the first message if it's yours, and writes
+`<channel>-thread-<ts>.jsonl` (`dm-<userID>-thread-<ts>.jsonl` for a DM).
+Deleting a thread's first message leaves the replies in place, under a
+"This message was deleted." placeholder. All other options work as usual.
+
+### Where have I posted?
+
+```sh
+make stats                  # top 30
+make stats TOP=0            # every conversation
+make stats SINCE=2024-01-01
+make stats TILL=30d         # what deleting all but the last 30 days would hit
+```
+
+Counts your messages per channel, private channel (🔒), group DM and DM via
+Slack search (`from:<you>`), and prints them most-posted first:
+
+```
+   1. 4210  #general  (C0123ABCD)
+   2.  873  DM UHKC0PXL5  (D0456EFGH)
+```
+
+DMs are shown by the other person's user ID, which is what `DM=` takes. Slack
+caps one search at about 10 000 results; past that, `stats` searches again for
+older messages, so it takes a few seconds per 100 messages. Like `scan`, it
+only sees what Slack's search index has (free workspaces: the last 90 days).
 
 ## Rate limits
 
@@ -225,6 +310,7 @@ For a large channel, expect roughly:
 - `.env.example` — template for your `.env`
 - `<channel>.jsonl` — generated by `scan`, consumed and updated by `delete`
   (written in the current working directory)
+- `dm-<userID>.jsonl` — the same for `DM=<userID>`
 
 ## Troubleshooting
 

@@ -71,7 +71,7 @@ wheels = [
 ]
 
 [[package]]
-name = "slack-delete"
+name = "slack-cleansing"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
