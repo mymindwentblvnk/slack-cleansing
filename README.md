@@ -42,7 +42,6 @@ Options, passed as `make <command> NAME=value`:
 | `SINCE=date`   | scan, stats         | Only collect messages from this point on, e.g. `2024-01-15`.        |
 | `TILL=date`    | scan, dry-run, delete, stats | Only messages before this point, e.g. `2026-09-01`, or `30d` for "keep the last 30 days". |
 | `YES=1`        | delete              | Skip the confirmation prompt.                                       |
-| `DELAY=1.1-1.4`| delete              | Seconds to wait between deletes; a number or a `MIN-MAX` range.     |
 | `TOP=30`       | stats               | How many conversations to list; `0` lists all.                      |
 | `DM=userID`    | scan, dry-run, delete | Work on your DM with this user (e.g. `U0123ABCD`) instead of a channel; uses `dm-<userID>.jsonl`. |
 | `THREAD=ts`    | scan, dry-run, delete | Only one thread of `CHANNEL` / `DM`, by its timestamp; uses `<channel>-thread-<ts>.jsonl`. |
@@ -205,9 +204,6 @@ Variables for `make delete` / `make dry-run`:
   also applies to a file scanned without `TILL`, so it's a safe way to keep
   recent messages; pass the same value to `dry-run` and `delete`.
 - `YES=1` — skip the confirmation prompt
-- `DELAY=1.1-1.4` — seconds between deletes; single float (e.g. `4`) or
-  `MIN-MAX` range for uniform random sleep (default `1.1-1.4`, ~45/min, just
-  under Slack's Tier 3 limit; 429s are handled with backoff)
 
 ### Direct messages with one person
 
@@ -285,14 +281,14 @@ only sees what Slack's search index has (free workspaces: the last 90 days).
 
 ## Rate limits
 
-`chat.delete` is a Tier 3 method (~50 requests/minute). The default delay is
-tuned to stay under that. The client also honours `Retry-After` on HTTP 429 and
+`chat.delete` is a Tier 3 method (~50 requests/minute). `delete` waits a
+random 1.1–1.4 s between deletes (~45/minute) to stay under that. The client also honours `Retry-After` on HTTP 429 and
 retries on `ratelimited` errors, so at worst a burst just slows down — you
 won't get banned for hitting the limit.
 
 For a large channel, expect roughly:
 
-| Messages | Time at default delay |
+| Messages | Time                  |
 |---------:|-----------------------|
 |      100 | ~2 min                |
 |    1 000 | ~22 min               |

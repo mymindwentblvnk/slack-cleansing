@@ -30,7 +30,6 @@
 #   SINCE       --since value for scan, stats    (default: $SLACK_SINCE)
 #   TILL        only messages before this date, or N days ago like 30d;
 #               for scan, dry-run, delete, stats (default: $SLACK_TILL)
-#   DELAY       --delay value for delete         (default: 1.1-1.4)
 #   YES         set to 1 to add --yes            (skip confirmation prompt)
 #   TOP         --top value for stats            (default: 30, 0 = all)
 
@@ -47,7 +46,6 @@ DOCKER_RUN = docker run --rm -it \
 YES_FLAG        := $(if $(YES),--yes)
 SINCE_FLAG      := $(if $(SINCE),--since $(SINCE))
 TILL_FLAG       := $(if $(TILL),--till $(TILL))
-DELAY_FLAG      := $(if $(DELAY),--delay $(DELAY))
 TARGET_FLAG     := $(if $(DM),--dm "$(DM)",$(if $(CHANNEL),--channel $(CHANNEL)))
 THREAD_FLAG     := $(if $(THREAD),--thread $(THREAD))
 TOP_FLAG        := $(if $(TOP),--top $(TOP))
@@ -57,7 +55,7 @@ TOP_FLAG        := $(if $(TOP),--top $(TOP))
 help:
 	@awk 'BEGIN{FS=":.*##"; printf "Targets:\n"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo
-	@echo "Variables: CHANNEL=... SINCE=... TILL=... DM=U... THREAD=ts DELAY=... YES=1 TOP=..."
+	@echo "Variables: CHANNEL=... SINCE=... TILL=... DM=U... THREAD=ts YES=1 TOP=..."
 
 build: ## Build the Docker image
 	docker build -t $(IMAGE) .
@@ -68,8 +66,8 @@ scan: ## Scan a channel or DM. CHANNEL=name or DM=userID (or SLACK_CHANNEL in .e
 dry-run: ## Preview deletes without touching Slack. CHANNEL=name or DM=userID [THREAD=] [TILL=]
 	$(DOCKER_RUN) delete $(TARGET_FLAG) $(THREAD_FLAG) --dry-run $(TILL_FLAG)
 
-delete: ## Delete messages. CHANNEL=name or DM=userID [THREAD=] [TILL=] [YES=1] [DELAY=1.5-3]
-	$(DOCKER_RUN) delete $(TARGET_FLAG) $(THREAD_FLAG) $(TILL_FLAG) $(YES_FLAG) $(DELAY_FLAG)
+delete: ## Delete messages. CHANNEL=name or DM=userID [THREAD=] [TILL=] [YES=1]
+	$(DOCKER_RUN) delete $(TARGET_FLAG) $(THREAD_FLAG) $(TILL_FLAG) $(YES_FLAG)
 
 stats: ## List where you've posted, most messages first. Optional: TOP=30 (0 = all) SINCE= TILL=
 	$(DOCKER_RUN) stats $(TOP_FLAG) $(SINCE_FLAG) $(TILL_FLAG)

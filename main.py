@@ -63,6 +63,9 @@ _METHOD_MIN_INTERVAL = {
 }
 _DEFAULT_MIN_INTERVAL = 0.2
 
+# Random sleep between deletes, in seconds: ~45/min, just under Tier 3.
+_DELETE_DELAY = (1.1, 1.4)
+
 
 def _describe_user(user: dict[str, Any]) -> str:
     profile = user.get("profile") or {}
@@ -580,19 +583,6 @@ def _rewrite_records(path: Path, records: list[dict[str, Any]]) -> None:
     tmp.replace(path)
 
 
-def _parse_delay(spec: str) -> tuple[float, float]:
-    """Return (min, max) seconds. Accepts 'N' or 'MIN-MAX'."""
-    s = spec.strip()
-    if "-" in s:
-        lo, hi = s.split("-", 1)
-        lo_f, hi_f = float(lo), float(hi)
-        if lo_f < 0 or hi_f < lo_f:
-            raise ValueError(f"invalid delay range: {spec!r}")
-        return lo_f, hi_f
-    v = float(s)
-    return v, v
-
-
 def cmd_delete(args: argparse.Namespace, slack: SlackClient) -> int:
     path = Path(args.file or _default_file(args))
     scanned_now = False
@@ -657,12 +647,8 @@ def cmd_delete(args: argparse.Namespace, slack: SlackClient) -> int:
             print("Aborted.")
             return 1
 
-    delay_lo, delay_hi = _parse_delay(args.delay)
-    print(
-        f"Sleeping {delay_lo:g}s between deletes"
-        if delay_lo == delay_hi
-        else f"Sleeping random {delay_lo:g}-{delay_hi:g}s between deletes"
-    )
+    delay_lo, delay_hi = _DELETE_DELAY
+    print(f"Sleeping random {delay_lo:g}-{delay_hi:g}s between deletes")
 
     failed = 0
     for i, rec in enumerate(pending, 1):
@@ -849,11 +835,6 @@ def main() -> int:
     )
     pd.add_argument("--dry-run", action="store_true")
     pd.add_argument("--yes", action="store_true")
-    pd.add_argument(
-        "--delay", default="1.1-1.4",
-        help="Seconds between deletes: single float (e.g. 4) or range 'MIN-MAX' "
-             "for uniform random sleep (default '1.1-1.4', ~45/min)",
-    )
 
     pt = sub.add_parser("stats", help="Count your messages per channel / DM")
     pt.add_argument(
