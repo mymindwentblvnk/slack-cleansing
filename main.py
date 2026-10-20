@@ -332,26 +332,6 @@ def _search_window(since_ts: str | None, till_ts: str | None) -> str:
         q += f" before:{day:%Y-%m-%d}"
     return q
 
-def _msg_has_image(msg: dict[str, Any]) -> bool:
-    for fobj in msg.get("files") or []:
-        mt = (fobj.get("mimetype") or "").lower()
-        if mt.startswith("image/"):
-            return True
-        if (fobj.get("filetype") or "").lower() in {"jpg", "jpeg", "png", "gif", "webp", "heic", "bmp", "tiff"}:
-            return True
-    return False
-
-
-def _msg_has_video(msg: dict[str, Any]) -> bool:
-    for fobj in msg.get("files") or []:
-        mt = (fobj.get("mimetype") or "").lower()
-        if mt.startswith("video/"):
-            return True
-        if (fobj.get("filetype") or "").lower() in {"mp4", "mov", "webm", "mkv", "avi", "m4v"}:
-            return True
-    return False
-
-
 def _search_thread_ts(match: dict[str, Any]) -> str | None:
     """Search matches don't carry `thread_ts`; it's only in the permalink."""
     qs = parse_qs(urlparse(match.get("permalink") or "").query)
@@ -383,8 +363,6 @@ def _scan_search(
             emit({
                 **rec,
                 "text_preview": (match.get("text", "") or "")[:120],
-                "has_image": _msg_has_image(match),
-                "has_video": _msg_has_video(match),
                 "deleted": False,
             })
         if scanned % 100 == 0:
@@ -408,8 +386,6 @@ def _scan_thread(
         emit({
             **rec,
             "text_preview": (msg.get("text", "") or "")[:120],
-            "has_image": _msg_has_image(msg),
-            "has_video": _msg_has_video(msg),
             "deleted": False,
         })
     return scanned
@@ -561,8 +537,6 @@ def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
                     "channel": channel_id,
                     "ts": msg["ts"],
                     "text_preview": (msg.get("text", "") or "")[:120],
-                    "has_image": _msg_has_image(msg),
-                    "has_video": _msg_has_video(msg),
                     "deleted": False,
                 })
             if msg.get("thread_ts") == msg.get("ts") and msg.get("reply_count", 0) > 0:
@@ -577,8 +551,6 @@ def cmd_scan(args: argparse.Namespace, slack: SlackClient) -> int:
                             "ts": reply["ts"],
                             "thread_ts": msg["ts"],
                             "text_preview": (reply.get("text", "") or "")[:120],
-                            "has_image": _msg_has_image(reply),
-                            "has_video": _msg_has_video(reply),
                             "deleted": False,
                         })
             if scanned % 50 == 0:
@@ -664,22 +636,11 @@ def cmd_delete(args: argparse.Namespace, slack: SlackClient) -> int:
         skipped_new = len(pending) - len(kept)
         pending = kept
 
-    skipped_media = 0
-    if args.skip_media:
-        kept = []
-        for r in pending:
-            if r.get("has_image") or r.get("has_video"):
-                skipped_media += 1
-            else:
-                kept.append(r)
-        pending = kept
-
     # Delete oldest first (ts is a Slack "seconds.microseconds" string; float() sorts fine).
     pending.sort(key=lambda r: float(r["ts"]))
-    already = len(records) - (len(pending) + skipped_media + skipped_new)
+    already = len(records) - (len(pending) + skipped_new)
     print(
         f"{len(records)} total, {already} already deleted, "
-        f"{skipped_media} skipped (media), "
         + (f"{skipped_new} skipped (not before --till), " if args.till else "")
         + f"{len(pending)} pending (oldest first)"
     )
@@ -888,10 +849,6 @@ def main() -> int:
     )
     pd.add_argument("--dry-run", action="store_true")
     pd.add_argument("--yes", action="store_true")
-    pd.add_argument(
-        "--skip-media", action="store_true",
-        help="Skip messages that contain a picture or video attachment",
-    )
     pd.add_argument(
         "--delay", default="1.1-1.4",
         help="Seconds between deletes: single float (e.g. 4) or range 'MIN-MAX' "

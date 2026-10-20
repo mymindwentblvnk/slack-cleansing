@@ -41,7 +41,6 @@ Options, passed as `make <command> NAME=value`:
 | `CHANNEL=name` | scan, dry-run, delete | Channel to work on. Defaults to `SLACK_CHANNEL` from `.env`.      |
 | `SINCE=date`   | scan, stats         | Only collect messages from this point on, e.g. `2024-01-15`.        |
 | `TILL=date`    | scan, dry-run, delete, stats | Only messages before this point, e.g. `2026-09-01`, or `30d` for "keep the last 30 days". |
-| `SKIP_MEDIA=1` | dry-run, delete     | Leave messages with a picture or video attachment alone.            |
 | `YES=1`        | delete              | Skip the confirmation prompt.                                       |
 | `DELAY=1.1-1.4`| delete              | Seconds to wait between deletes; a number or a `MIN-MAX` range.     |
 | `TOP=30`       | stats               | How many conversations to list; `0` lists all.                      |
@@ -143,7 +142,7 @@ make scan CHANNEL=my-channel
 Writes `my-channel.jsonl` in the current directory. Each line looks like:
 
 ```json
-{"channel":"C0123","ts":"1700000000.000100","text_preview":"hi","has_image":false,"has_video":false,"deleted":false}
+{"channel":"C0123","ts":"1700000000.000100","text_preview":"hi","deleted":false}
 ```
 
 Thread replies are included (with a `thread_ts` field).
@@ -205,7 +204,6 @@ Variables for `make delete` / `make dry-run`:
 - `TILL=30d` / `TILL=2026-09-15` — only delete messages before that point. This
   also applies to a file scanned without `TILL`, so it's a safe way to keep
   recent messages; pass the same value to `dry-run` and `delete`.
-- `SKIP_MEDIA=1` — don't delete messages with a picture or video attachment
 - `YES=1` — skip the confirmation prompt
 - `DELAY=1.1-1.4` — seconds between deletes; single float (e.g. `4`) or
   `MIN-MAX` range for uniform random sleep (default `1.1-1.4`, ~45/min, just
