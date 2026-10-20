@@ -2,7 +2,6 @@
 #
 # Usage examples:
 #   make build
-#   make scan                            # uses SLACK_CHANNEL from .env
 #   make scan CHANNEL=random
 #   make scan CHANNEL=random SINCE=2024-01-15
 #   make dry-run CHANNEL=random
@@ -19,7 +18,6 @@
 #   IMAGE       Docker image tag                 (default: slack-cleansing)
 #   ENV_FILE    Path to env file                 (default: .env)
 #   CHANNEL     Channel name; scan writes and delete reads <channel>.jsonl
-#                                                (default: $SLACK_CHANNEL from .env)
 #   DM          User ID (e.g. U0123ABCD) whose DM to use instead of a channel;
 #               scan writes and delete reads dm-<DM>.jsonl. Takes precedence
 #               over CHANNEL.
@@ -56,7 +54,7 @@ help:
 build: ## Build the Docker image
 	docker build -t $(IMAGE) .
 
-scan: ## Scan a channel or DM. CHANNEL=name or DM=userID (or SLACK_CHANNEL in .env). Optional: THREAD= SINCE= TILL=
+scan: ## Scan a channel or DM. CHANNEL=name or DM=userID. Optional: THREAD= SINCE= TILL=
 	$(DOCKER_RUN) scan $(TARGET_FLAG) $(THREAD_FLAG) $(SINCE_FLAG) $(TILL_FLAG)
 
 dry-run: ## Preview deletes without touching Slack. CHANNEL=name or DM=userID [THREAD=] [TILL=]

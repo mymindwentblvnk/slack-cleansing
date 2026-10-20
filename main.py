@@ -697,10 +697,7 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     ps = sub.add_parser("scan", help="Collect message IDs to a JSONL file")
-    ps.add_argument(
-        "--channel", default=os.environ.get("SLACK_CHANNEL"),
-        help="Channel name, e.g. my-channel (env: SLACK_CHANNEL)",
-    )
+    ps.add_argument("--channel", help="Channel name, e.g. my-channel")
     ps.add_argument(
         "--dm",
         help="Scan your DM with this user ID (e.g. U0123ABCD) instead of a "
@@ -728,10 +725,7 @@ def main() -> int:
     )
 
     pd = sub.add_parser("delete", help="Delete messages listed in a JSONL file")
-    pd.add_argument(
-        "--channel", default=os.environ.get("SLACK_CHANNEL"),
-        help="Channel name; deletes from <channel>.jsonl (env: SLACK_CHANNEL)",
-    )
+    pd.add_argument("--channel", help="Channel name; deletes from <channel>.jsonl")
     pd.add_argument(
         "--dm",
         help="Delete from dm-<user ID>.jsonl (produced by scan --dm <user ID>)",
@@ -759,10 +753,10 @@ def main() -> int:
         print("ERROR: --workspace or SLACK_WORKSPACE is required", file=sys.stderr)
         return 2
     if args.cmd == "scan" and not (args.channel or args.dm):
-        print("ERROR: scan: --channel, --dm or SLACK_CHANNEL is required", file=sys.stderr)
+        print("ERROR: scan: --channel or --dm is required", file=sys.stderr)
         return 2
     if args.cmd == "delete" and not (args.channel or args.file or args.dm):
-        print("ERROR: delete: --channel, --dm or SLACK_CHANNEL is required", file=sys.stderr)
+        print("ERROR: delete: --channel or --dm is required", file=sys.stderr)
         return 2
 
     if getattr(args, "thread", None):

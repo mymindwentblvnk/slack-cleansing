@@ -37,7 +37,7 @@ Options, passed as `make <command> NAME=value`:
 
 | Option         | Commands            | What it does                                                        |
 |----------------|---------------------|---------------------------------------------------------------------|
-| `CHANNEL=name` | scan, dry-run, delete | Channel to work on. Defaults to `SLACK_CHANNEL` from `.env`.      |
+| `CHANNEL=name` | scan, dry-run, delete | Channel to work on.                                                 |
 | `SINCE=date`   | scan                | Only collect messages from this point on, e.g. `2024-01-15`.        |
 | `TILL=date`    | scan, dry-run, delete | Only messages before this point, e.g. `2026-09-01`, or `30d` for "keep the last 30 days". |
 | `YES=1`        | delete              | Skip the confirmation prompt.                                       |
@@ -73,11 +73,10 @@ The tool reads `.env` from the current directory. Supported keys:
 | `SLACK_WORKSPACE`| yes      | Workspace subdomain, e.g. `acme-corp`               |
 | `SLACK_TOKEN`    | yes      | Browser `xoxc-...` token                            |
 | `SLACK_COOKIE_D` | yes      | Value of the `d` cookie (`xoxd-...`)                |
-| `SLACK_CHANNEL`  | no       | Default `CHANNEL=` for `make scan` / `make delete`  |
 | `SLACK_SINCE`    | no       | Default `SINCE=` for `make scan`                    |
 | `SLACK_TILL`     | no       | Default `TILL=` for scan, dry-run and delete        |
 
-Make variables (`CHANNEL=`, `SINCE=`, etc.) override the matching env var. See
+`SINCE=` and `TILL=` override the matching env var. See
 `.env.example`.
 
 ## Get your Slack credentials
