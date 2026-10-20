@@ -13,8 +13,6 @@
 #   make delete DM=U0123ABCD TILL=30d    # keep the last 30 days
 #   make scan CHANNEL=random THREAD=1700000000.000100  # just one thread
 #   make delete CHANNEL=random THREAD=1700000000.000100
-#   make stats                           # your message count per channel / DM
-#   make stats TOP=0 SINCE=2024-01-01    # all conversations, since a date
 #   make shell                           # drop into the container for debugging
 #
 # Variables (override on the command line, e.g. `make scan CHANNEL=foo`):
@@ -27,11 +25,10 @@
 #               over CHANNEL.
 #   THREAD      Thread ts (or p-number from its link) within CHANNEL / DM;
 #               scan writes and delete reads <channel>-thread-<ts>.jsonl
-#   SINCE       --since value for scan, stats    (default: $SLACK_SINCE)
+#   SINCE       --since value for scan           (default: $SLACK_SINCE)
 #   TILL        only messages before this date, or N days ago like 30d;
-#               for scan, dry-run, delete, stats (default: $SLACK_TILL)
+#               for scan, dry-run, delete        (default: $SLACK_TILL)
 #   YES         set to 1 to add --yes            (skip confirmation prompt)
-#   TOP         --top value for stats            (default: 30, 0 = all)
 
 IMAGE     ?= slack-cleansing
 ENV_FILE  ?= .env
@@ -48,14 +45,13 @@ SINCE_FLAG      := $(if $(SINCE),--since $(SINCE))
 TILL_FLAG       := $(if $(TILL),--till $(TILL))
 TARGET_FLAG     := $(if $(DM),--dm "$(DM)",$(if $(CHANNEL),--channel $(CHANNEL)))
 THREAD_FLAG     := $(if $(THREAD),--thread $(THREAD))
-TOP_FLAG        := $(if $(TOP),--top $(TOP))
 
-.PHONY: help build scan dry-run delete stats shell clean
+.PHONY: help build scan dry-run delete shell clean
 
 help:
 	@awk 'BEGIN{FS=":.*##"; printf "Targets:\n"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo
-	@echo "Variables: CHANNEL=... SINCE=... TILL=... DM=U... THREAD=ts YES=1 TOP=..."
+	@echo "Variables: CHANNEL=... SINCE=... TILL=... DM=U... THREAD=ts YES=1"
 
 build: ## Build the Docker image
 	docker build -t $(IMAGE) .
@@ -68,9 +64,6 @@ dry-run: ## Preview deletes without touching Slack. CHANNEL=name or DM=userID [T
 
 delete: ## Delete messages. CHANNEL=name or DM=userID [THREAD=] [TILL=] [YES=1]
 	$(DOCKER_RUN) delete $(TARGET_FLAG) $(THREAD_FLAG) $(TILL_FLAG) $(YES_FLAG)
-
-stats: ## List where you've posted, most messages first. Optional: TOP=30 (0 = all) SINCE= TILL=
-	$(DOCKER_RUN) stats $(TOP_FLAG) $(SINCE_FLAG) $(TILL_FLAG)
 
 shell: ## Open a shell in the image (debugging)
 	docker run --rm -it --env-file $(ENV_FILE) -v "$(CURDIR):/work" \

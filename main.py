@@ -1,11 +1,10 @@
 """Delete all of your own messages in a Slack channel using browser session tokens.
 
-Three subcommands:
+Two subcommands:
   scan    - find all your message IDs in a channel (via Slack search), save
             to a JSONL file; with --dm <user ID>, scan your direct messages
             with that person instead (reading the whole conversation)
   delete  - read the channel's JSONL file and delete each message, marking progress
-  stats   - count your messages per channel / DM (via Slack search), top first
 
 Uses the unofficial xoxc token + `d` cookie from a logged-in Slack web session.
 This is against Slack's Terms of Service; use at your own risk.
@@ -91,7 +90,6 @@ class SlackClient:
             },
         )
         self._last_call: dict[str, float] = {}
-        self.search_capped = False
 
     def close(self) -> None:
         self.client.close()
@@ -221,12 +219,8 @@ class SlackClient:
             if not cursor:
                 return
 
-    def iter_search(
-        self, query: str, warn_cap: bool = True,
-    ) -> Iterator[dict[str, Any]]:
-        """Yield `search.messages` matches, newest first. Sets
-        `self.search_capped` if Slack's page limit cut the results short."""
-        self.search_capped = False
+    def iter_search(self, query: str) -> Iterator[dict[str, Any]]:
+        """Yield `search.messages` matches, newest first."""
         cursor = "*"
         page = 1
         while True:
@@ -259,9 +253,6 @@ class SlackClient:
                 return
             page += 1
             if page > 100:
-                self.search_capped = True
-                if not warn_cap:
-                    return
                 print(
                     "  WARNING: search results capped at 100 pages; re-run with "
                     "an older --since window to get the rest",
@@ -671,80 +662,6 @@ def cmd_delete(args: argparse.Namespace, slack: SlackClient) -> int:
     return 0 if failed == 0 else 1
 
 
-# ---------- stats ----------
-
-def _conversation_label(ch: dict[str, Any]) -> str:
-    if ch.get("is_im"):
-        return f"DM {ch.get('name')}"  # a DM's search "name" is the user ID
-    if ch.get("is_mpim"):
-        return f"group DM {ch.get('name')}"
-    prefix = "🔒" if ch.get("is_private") or ch.get("is_group") else "#"
-    return f"{prefix}{ch.get('name')}"
-
-
-def cmd_stats(args: argparse.Namespace, slack: SlackClient) -> int:
-    me = slack.auth_test()
-    user_id = me["user_id"]
-    print(f"Authenticated as {me.get('user')} ({user_id}) in {me.get('team')}")
-
-    since_ts, till_ts = _time_window(args)
-    base = f"from:<@{user_id}>" + _search_window(since_ts, None)
-
-    seen: set[tuple[str, str]] = set()
-    counts: dict[str, int] = {}
-    labels: dict[str, str] = {}
-    before: datetime | None = None
-    if till_ts:
-        before = datetime.fromtimestamp(float(till_ts)) + timedelta(days=2)
-    # Slack stops returning results after ~100 pages, so whenever a pass is cut
-    # short, search again for messages older than the oldest one seen. `before:` is
-    # day-granular and timezone-fuzzy, so the windows overlap a little and
-    # dedup handles that; a pass with nothing new moves back a day.
-    while True:
-        query = base + (f" before:{before:%Y-%m-%d}" if before else "")
-        print(f"Searching: {query}", flush=True)
-        new = 0
-        hits = 0
-        for match in slack.iter_search(query, warn_cap=False):
-            hits += 1
-            ch = match.get("channel") or {}
-            ts = match.get("ts")
-            if not ts or not ch.get("id") or match.get("user") != user_id:
-                continue
-            if not _in_window(ts, since_ts, till_ts):
-                continue
-            key = (ch["id"], ts)
-            if key in seen:
-                continue
-            seen.add(key)
-            new += 1
-            counts[ch["id"]] = counts.get(ch["id"], 0) + 1
-            labels.setdefault(ch["id"], _conversation_label(ch))
-            if len(seen) % 1000 == 0:
-                print(f"  counted={len(seen)}", flush=True)
-        if not hits or (new and not slack.search_capped):
-            break
-        if new:
-            oldest = min(float(ts) for _, ts in seen)
-            before = datetime.fromtimestamp(oldest) + timedelta(days=2)
-        elif before:
-            before -= timedelta(days=1)
-        else:
-            break
-
-    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
-    shown = ranked[: args.top] if args.top else ranked
-    print()
-    print(
-        f"{len(seen)} messages in {len(counts)} conversations"
-        + (f" (top {len(shown)})" if len(shown) < len(ranked) else "")
-    )
-    width = len(str(shown[0][1])) if shown else 1
-    for rank, (cid, n) in enumerate(shown, 1):
-        print(f"{rank:>4}. {n:>{width}}  {labels[cid]}  ({cid})")
-    return 0
-
-
 # ---------- entrypoint ----------
 
 def _load_dotenv(path: Path) -> None:
@@ -836,22 +753,6 @@ def main() -> int:
     pd.add_argument("--dry-run", action="store_true")
     pd.add_argument("--yes", action="store_true")
 
-    pt = sub.add_parser("stats", help="Count your messages per channel / DM")
-    pt.add_argument(
-        "--since", default=os.environ.get("SLACK_SINCE"),
-        help="Only count messages at or after this time (same formats as "
-             "scan --since). (env: SLACK_SINCE)",
-    )
-    pt.add_argument(
-        "--till", default=os.environ.get("SLACK_TILL"),
-        help="Only messages before this time, e.g. 30d to leave the last 30 "
-             "days alone. Same formats as --since. (env: SLACK_TILL)",
-    )
-    pt.add_argument(
-        "--top", type=int, default=30,
-        help="How many conversations to list (default 30, 0 = all)",
-    )
-
     args = p.parse_args()
 
     if not args.workspace:
@@ -898,8 +799,6 @@ def main() -> int:
             return cmd_scan(args, slack)
         if args.cmd == "delete":
             return cmd_delete(args, slack)
-        if args.cmd == "stats":
-            return cmd_stats(args, slack)
         return 2
     finally:
         slack.close()
